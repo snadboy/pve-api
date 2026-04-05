@@ -1,0 +1,9 @@
+{
+  "name": "pve-api",
+  "version": "1.0.0",
+  "description": "Proxmox VE REST API for homelab cluster",
+  "scripts": {
+    "start": "bun run server.ts",
+    "dev": "bun --watch run server.ts"
+  }
+}
