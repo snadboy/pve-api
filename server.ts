@@ -72,13 +72,23 @@ function formatUptime(seconds: number): number {
   return Math.round((seconds / 3600) * 10) / 10; // hours, 1 decimal
 }
 
+const PSEUDO_FS = new Set(["squashfs", "erofs", "tmpfs", "devtmpfs", "vfat", "overlay", "overlayfs", "romfs", "proc", "sysfs", "cgroup", "cgroup2", "pstore", "hugetlbfs", "mqueue", "debugfs", "tracefs"]);
+
 async function fetchAgentDisk(ip: string, nodeName: string, vmid: number): Promise<{ used_gb: number; total_gb: number; usage_pct: number } | null> {
   try {
-    const fsinfo = await pveGet(ip, `/api2/json/nodes/${nodeName}/qemu/${vmid}/agent/get-fsinfo`);
-    const root = (fsinfo || []).find((fs: any) => fs.mountpoint === "/");
-    if (!root || !root["total-bytes"]) return null;
-    const used = root["used-bytes"] || 0;
-    const total = root["total-bytes"];
+    const data = await pveGet(ip, `/api2/json/nodes/${nodeName}/qemu/${vmid}/agent/get-fsinfo`);
+    const fslist: any[] = data?.result || [];
+
+    // Exclude read-only/pseudo filesystems, deduplicate by total-bytes, pick largest
+    const seen = new Set<number>();
+    const main = fslist
+      .filter((fs: any) => !PSEUDO_FS.has(fs.type) && (fs["total-bytes"] || 0) > 0)
+      .filter((fs: any) => { const t = fs["total-bytes"]; if (seen.has(t)) return false; seen.add(t); return true; })
+      .sort((a: any, b: any) => (b["total-bytes"] || 0) - (a["total-bytes"] || 0))[0];
+
+    if (!main) return null;
+    const used = main["used-bytes"] || 0;
+    const total = main["total-bytes"];
     return {
       used_gb: formatBytes(used),
       total_gb: formatBytes(total),
