@@ -296,6 +296,56 @@ async function getBackupData(pbs: PbsConfig) {
   return data;
 }
 
+// --- Stale backup helpers ---
+
+async function pbsDelete(host: string, token: string, path: string): Promise<any> {
+  const resp = await fetch(`https://${host}:8007${path}`, {
+    method: "DELETE",
+    headers: { Authorization: `PBSAPIToken=${token}` },
+    // @ts-ignore
+    tls: { rejectUnauthorized: false },
+  });
+  if (!resp.ok) throw new Error(`PBS DELETE ${host}${path}: ${resp.status}`);
+  return resp.json();
+}
+
+async function getAllCurrentVmids(): Promise<Set<string>> {
+  const vmids = new Set<string>();
+  const allClusters = await getAllClusters();
+  for (const cluster of allClusters.clusters) {
+    for (const node of cluster.nodes) {
+      for (const vm of (node as any).vms || []) vmids.add(String(vm.vmid));
+      for (const ct of (node as any).containers || []) vmids.add(String(ct.vmid));
+    }
+  }
+  return vmids;
+}
+
+async function findStaleGuests(pbs: PbsConfig, days: number) {
+  const [backupData, currentVmids] = await Promise.all([
+    getBackupData(pbs),
+    getAllCurrentVmids(),
+  ]);
+  const cutoffMs = days * 86400 * 1000;
+  return backupData.guests
+    .filter((g: any) => {
+      if (isNaN(parseInt(g.backup_id))) return false; // skip standalone hosts
+      if (currentVmids.has(g.backup_id)) return false; // still exists
+      const ageMs = Date.now() - new Date(g.latest.time).getTime();
+      return ageMs > cutoffMs;
+    })
+    .map((g: any) => ({
+      backup_id: g.backup_id,
+      backup_type: g.backup_type,
+      pbs_type: g.backup_type === "vm" ? "vm" : "ct",
+      snapshot_count: g.snapshot_count,
+      latest: g.latest.time,
+      oldest: g.oldest.time,
+      age_days: Math.round((Date.now() - new Date(g.latest.time).getTime()) / 86400_000),
+      size_gb: g.latest.size_gb,
+    }));
+}
+
 // Resolve PBS instance — fall back to env vars if no config instances defined
 function getPbsInstances(): PbsConfig[] {
   if (pbsInstances.length > 0) return pbsInstances;
@@ -368,6 +418,42 @@ Bun.serve({
       try {
         const results = await Promise.all(instances.map(getBackupData));
         return Response.json({ pbs: results, fetched_at: new Date().toISOString() });
+      } catch (err: any) {
+        return Response.json({ error: err.message }, { status: 503 });
+      }
+    }
+
+    // GET  /api/pbs/:name/stale?days=N  — list stale backup groups (dry run)
+    // DELETE /api/pbs/:name/stale?days=N — delete stale backup groups
+    if (path.match(/^\/api\/pbs\/[^/]+\/stale$/)) {
+      const pbsName = path.split("/")[3];
+      const instances = getPbsInstances();
+      const pbs = instances.find((p) => p.name === pbsName);
+      if (!pbs) return Response.json({ error: "PBS instance not found" }, { status: 404 });
+      const days = parseInt(url.searchParams.get("days") || "30");
+      try {
+        const stale = await findStaleGuests(pbs, days);
+        if (req.method === "GET") {
+          return Response.json({ pbs: pbsName, days, stale, count: stale.length });
+        }
+        if (req.method === "DELETE") {
+          const token = pbs.token || PBS_TOKEN;
+          const deleted: any[] = [];
+          const errors: any[] = [];
+          for (const g of stale) {
+            try {
+              await pbsDelete(pbs.host, token,
+                `/api2/json/admin/datastore/${pbs.datastore}/groups?backup-type=${g.pbs_type}&backup-id=${g.backup_id}`
+              );
+              deleted.push(g);
+              pbsCaches.delete(pbs.name); // invalidate cache
+            } catch (err: any) {
+              errors.push({ ...g, error: err.message });
+            }
+          }
+          return Response.json({ pbs: pbsName, days, deleted, errors, deleted_count: deleted.length });
+        }
+        return Response.json({ error: "Method not allowed" }, { status: 405 });
       } catch (err: any) {
         return Response.json({ error: err.message }, { status: 503 });
       }
