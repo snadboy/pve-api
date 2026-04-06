@@ -91,6 +91,11 @@ async function fetchGuests(ip: string, nodeName: string, type: "qemu" | "lxc") {
         total_gb: formatBytes(g.maxmem || 0),
         usage_pct: g.maxmem ? Math.round(((g.mem || 0) / g.maxmem) * 100 * 10) / 10 : 0,
       },
+      disk: {
+        used_gb: formatBytes(g.disk || 0),
+        total_gb: formatBytes(g.maxdisk || 0),
+        usage_pct: g.maxdisk ? Math.round(((g.disk || 0) / g.maxdisk) * 100 * 10) / 10 : 0,
+      },
     }));
 }
 
@@ -115,6 +120,13 @@ async function fetchNode(node: NodeConfig) {
         total_gb: formatBytes(status.memory?.total || 0),
         usage_pct: status.memory?.total
           ? Math.round(((status.memory.used || 0) / status.memory.total) * 100 * 10) / 10
+          : 0,
+      },
+      disk: {
+        used_gb: formatBytes(status.rootfs?.used || 0),
+        total_gb: formatBytes(status.rootfs?.total || 0),
+        usage_pct: status.rootfs?.total
+          ? Math.round(((status.rootfs.used || 0) / status.rootfs.total) * 100 * 10) / 10
           : 0,
       },
       vms,
