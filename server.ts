@@ -202,7 +202,7 @@ async function getBackupData(pbs: PbsConfig) {
       const backupType = key.split("/")[0];
       return {
         backup_id: latest["backup-id"],
-        backup_type: backupType === "vm" ? "vm" : "lxc",
+        backup_type: backupType === "vm" ? "vm" : backupType === "ct" ? "lxc" : backupType,
         snapshot_count: snaps.length,
         latest: {
           time: new Date((latest["backup-time"] || 0) * 1000).toISOString(),
