@@ -72,11 +72,39 @@ function formatUptime(seconds: number): number {
   return Math.round((seconds / 3600) * 10) / 10; // hours, 1 decimal
 }
 
+async function fetchAgentDisk(ip: string, nodeName: string, vmid: number): Promise<{ used_gb: number; total_gb: number; usage_pct: number } | null> {
+  try {
+    const fsinfo = await pveGet(ip, `/api2/json/nodes/${nodeName}/qemu/${vmid}/agent/get-fsinfo`);
+    const root = (fsinfo || []).find((fs: any) => fs.mountpoint === "/");
+    if (!root || !root["total-bytes"]) return null;
+    const used = root["used-bytes"] || 0;
+    const total = root["total-bytes"];
+    return {
+      used_gb: formatBytes(used),
+      total_gb: formatBytes(total),
+      usage_pct: Math.round((used / total) * 100 * 10) / 10,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function fetchGuests(ip: string, nodeName: string, type: "qemu" | "lxc") {
   const items = await pveGet(ip, `/api2/json/nodes/${nodeName}/${type}`);
-  return (items || [])
-    .sort((a: any, b: any) => a.vmid - b.vmid)
-    .map((g: any) => ({
+  const sorted = (items || []).sort((a: any, b: any) => a.vmid - b.vmid);
+
+  // For VMs: fetch agent disk info in parallel, fall back to maxdisk if unavailable
+  const agentDisks = new Map<number, { used_gb: number; total_gb: number; usage_pct: number }>();
+  if (type === "qemu") {
+    const results = await Promise.all(
+      sorted.map((g: any) => fetchAgentDisk(ip, nodeName, g.vmid).then((d) => ({ vmid: g.vmid, d })))
+    );
+    for (const { vmid, d } of results) {
+      if (d) agentDisks.set(vmid, d);
+    }
+  }
+
+  return sorted.map((g: any) => ({
       vmid: g.vmid,
       name: g.name,
       type: type === "qemu" ? "vm" : "lxc",
@@ -91,7 +119,7 @@ async function fetchGuests(ip: string, nodeName: string, type: "qemu" | "lxc") {
         total_gb: formatBytes(g.maxmem || 0),
         usage_pct: g.maxmem ? Math.round(((g.mem || 0) / g.maxmem) * 100 * 10) / 10 : 0,
       },
-      disk: {
+      disk: agentDisks.get(g.vmid) ?? {
         used_gb: formatBytes(g.disk || 0),
         total_gb: formatBytes(g.maxdisk || 0),
         usage_pct: g.maxdisk ? Math.round(((g.disk || 0) / g.maxdisk) * 100 * 10) / 10 : 0,
