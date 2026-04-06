@@ -11,7 +11,7 @@ const PBS_DATASTORE = process.env.PBS_DATASTORE || "backups-ssd";
 
 interface NodeConfig { name: string; ip: string; }
 interface ClusterConfig { name: string; nodes: NodeConfig[]; }
-interface PbsConfig { name: string; host: string; datastore: string; }
+interface PbsConfig { name: string; host: string; datastore: string; token?: string; }
 
 let clusters: ClusterConfig[] = [];
 let pbsInstances: PbsConfig[] = [];
@@ -178,8 +178,8 @@ async function getBackupData(pbs: PbsConfig) {
   const cached = pbsCaches.get(pbs.name);
   if (cached && Date.now() - cached.ts < BACKUP_CACHE_TTL) return cached.data;
 
-  // PBS_TOKEN env var may be the full "root@pam!name:secret" or just the secret
-  const token = PBS_TOKEN.includes("!") ? PBS_TOKEN : PBS_TOKEN;
+  // Use per-instance token from config, fall back to PBS_TOKEN env var
+  const token = pbs.token || PBS_TOKEN;
   const firstNode = clusters[0]?.nodes[0];
 
   const [snapshots, storageStatus, backupJobs] = await Promise.all([
