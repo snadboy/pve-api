@@ -11,15 +11,18 @@ const PBS_DATASTORE = process.env.PBS_DATASTORE || "backups-ssd";
 
 interface NodeConfig { name: string; ip: string; }
 interface ClusterConfig { name: string; nodes: NodeConfig[]; }
+interface PbsConfig { name: string; host: string; datastore: string; }
 
 let clusters: ClusterConfig[] = [];
+let pbsInstances: PbsConfig[] = [];
 
 try {
   const configFile = Bun.file("/config/config.json");
   if (await configFile.exists()) {
     const config = await configFile.json();
     clusters = config.clusters || [];
-    console.log(`Loaded ${clusters.length} cluster(s) from config.json`);
+    pbsInstances = config.pbs_instances || [];
+    console.log(`Loaded ${clusters.length} cluster(s), ${pbsInstances.length} PBS instance(s) from config.json`);
   }
 } catch {}
 
@@ -157,31 +160,32 @@ async function getAllClusters() {
 
 // --- PBS API helpers ---
 
-async function pbsGet(path: string): Promise<any> {
-  if (!PBS_HOST || !PBS_AUTH_HEADER) throw new Error("PBS not configured");
-  const resp = await fetch(`https://${PBS_HOST}:8007${path}`, {
-    headers: { Authorization: PBS_AUTH_HEADER },
+async function pbsGet(host: string, token: string, path: string): Promise<any> {
+  const resp = await fetch(`https://${host}:8007${path}`, {
+    headers: { Authorization: `PBSAPIToken=${token}` },
     // @ts-ignore
     tls: { rejectUnauthorized: false },
   });
-  if (!resp.ok) throw new Error(`PBS ${path}: ${resp.status}`);
+  if (!resp.ok) throw new Error(`PBS ${host}${path}: ${resp.status}`);
   const json = await resp.json();
   return json.data;
 }
 
-let backupCache: { data: any; ts: number } | null = null;
+const pbsCaches = new Map<string, { data: any; ts: number }>();
 const BACKUP_CACHE_TTL = 120_000; // 2min
 
-async function getBackupData() {
-  if (backupCache && Date.now() - backupCache.ts < BACKUP_CACHE_TTL) return backupCache.data;
+async function getBackupData(pbs: PbsConfig) {
+  const cached = pbsCaches.get(pbs.name);
+  if (cached && Date.now() - cached.ts < BACKUP_CACHE_TTL) return cached.data;
 
-  // Use first node of first cluster for PVE backup job queries
-  const firstNode = clusters[0].nodes[0];
+  // PBS_TOKEN env var may be the full "root@pam!name:secret" or just the secret
+  const token = PBS_TOKEN.includes("!") ? PBS_TOKEN : PBS_TOKEN;
+  const firstNode = clusters[0]?.nodes[0];
 
   const [snapshots, storageStatus, backupJobs] = await Promise.all([
-    pbsGet(`/api2/json/admin/datastore/${PBS_DATASTORE}/snapshots`),
-    pbsGet(`/api2/json/admin/datastore/${PBS_DATASTORE}/status`),
-    pveGet(firstNode.ip, "/api2/json/cluster/backup"),
+    pbsGet(pbs.host, token, `/api2/json/admin/datastore/${pbs.datastore}/snapshots`),
+    pbsGet(pbs.host, token, `/api2/json/admin/datastore/${pbs.datastore}/status`),
+    firstNode ? pveGet(firstNode.ip, "/api2/json/cluster/backup") : Promise.resolve([]),
   ]);
 
   const byGuest = new Map<string, any[]>();
@@ -216,7 +220,8 @@ async function getBackupData() {
     .sort((a, b) => a.backup_id.localeCompare(b.backup_id));
 
   const storage = {
-    datastore: PBS_DATASTORE,
+    name: pbs.name,
+    datastore: pbs.datastore,
     total_gb: formatBytes(storageStatus.total || 0),
     used_gb: formatBytes(storageStatus.used || 0),
     available_gb: formatBytes(storageStatus.avail || 0),
@@ -236,9 +241,16 @@ async function getBackupData() {
     next_run: j["next-run"] ? new Date(j["next-run"] * 1000).toISOString() : null,
   }));
 
-  const data = { storage, guests, jobs, fetched_at: new Date().toISOString() };
-  backupCache = { data, ts: Date.now() };
+  const data = { name: pbs.name, storage, guests, jobs, fetched_at: new Date().toISOString() };
+  pbsCaches.set(pbs.name, { data, ts: Date.now() });
   return data;
+}
+
+// Resolve PBS instance — fall back to env vars if no config instances defined
+function getPbsInstances(): PbsConfig[] {
+  if (pbsInstances.length > 0) return pbsInstances;
+  if (PBS_HOST) return [{ name: "default", host: PBS_HOST, datastore: PBS_DATASTORE }];
+  return [];
 }
 
 // --- HTTP server ---
@@ -298,11 +310,38 @@ Bun.serve({
       return Response.json(node);
     }
 
-    // --- Backup endpoints ---
+    // --- PBS endpoints ---
 
-    if (path === "/api/backups") {
+    if (path === "/api/pbs") {
+      const instances = getPbsInstances();
+      if (instances.length === 0) return Response.json({ error: "No PBS instances configured" }, { status: 503 });
       try {
-        const data = await getBackupData();
+        const results = await Promise.all(instances.map(getBackupData));
+        return Response.json({ pbs: results, fetched_at: new Date().toISOString() });
+      } catch (err: any) {
+        return Response.json({ error: err.message }, { status: 503 });
+      }
+    }
+
+    if (path.startsWith("/api/pbs/")) {
+      const pbsName = path.split("/")[3];
+      const instances = getPbsInstances();
+      const pbs = instances.find((p) => p.name === pbsName);
+      if (!pbs) return Response.json({ error: "PBS instance not found" }, { status: 404 });
+      try {
+        const data = await getBackupData(pbs);
+        return Response.json(data);
+      } catch (err: any) {
+        return Response.json({ error: err.message }, { status: 503 });
+      }
+    }
+
+    // Legacy /api/backups — uses first PBS instance
+    if (path === "/api/backups") {
+      const instances = getPbsInstances();
+      if (instances.length === 0) return Response.json({ error: "PBS not configured" }, { status: 503 });
+      try {
+        const data = await getBackupData(instances[0]);
         return Response.json(data);
       } catch (err: any) {
         return Response.json({ error: err.message }, { status: 503 });
@@ -310,8 +349,10 @@ Bun.serve({
     }
 
     if (path === "/api/backups/storage") {
+      const instances = getPbsInstances();
+      if (instances.length === 0) return Response.json({ error: "PBS not configured" }, { status: 503 });
       try {
-        const data = await getBackupData();
+        const data = await getBackupData(instances[0]);
         return Response.json(data.storage);
       } catch (err: any) {
         return Response.json({ error: err.message }, { status: 503 });
@@ -319,8 +360,10 @@ Bun.serve({
     }
 
     if (path === "/api/backups/jobs") {
+      const instances = getPbsInstances();
+      if (instances.length === 0) return Response.json({ error: "PBS not configured" }, { status: 503 });
       try {
-        const data = await getBackupData();
+        const data = await getBackupData(instances[0]);
         return Response.json({ jobs: data.jobs });
       } catch (err: any) {
         return Response.json({ error: err.message }, { status: 503 });
